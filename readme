@@ -1,0 +1,56 @@
+# PacketLens — Network Traffic Analyzer
+
+PacketLens is a Python-based network traffic analyzer built with **Scapy**. It reads PCAP files and analyzes captured network packets to extract useful information about network protocols and DNS activity.
+
+## Features
+
+### 1. PCAP File Reading
+- Reads network traffic from PCAP files.
+- Uses Scapy to load captured packets.
+
+### 2. Protocol Analysis
+- Identifies TCP, UDP, and ICMP packets.
+- Counts packets by protocol.
+- Detects DNS traffic.
+
+### 3. DNS Analysis
+- Extracts DNS queries and responses.
+- Identifies queried domain names.
+- Displays the most frequently queried domains.
+- Analyzes DNS query types.
+- Extracts DNS answer records.
+- Maps domain names to IP addresses.
+- Matches DNS queries with their corresponding responses using DNS transaction IDs.
+- Calculates DNS transaction statistics.
+- Analyzes DNS response codes, including successful and failed responses.
+
+## Project Structure
+
+```text
+PacketLens/
+├── main.py
+├── pcap_reader.py
+├── analyzer.py
+├── test_analyzer.py
+├── captures/
+│   └── dns.cap
+└── reports/
+```
+
+### Implemented Files
+
+- **pcap_reader.py** — Handles reading PCAP files.
+- **analyzer.py** — Contains the network traffic analysis logic.
+- **test_analyzer.py** — Runs and tests the analyzer.
+
+## Technologies Used
+
+- Python
+- Scapy
+- PCAP
+
+## Current Project Status
+
+PacketLens currently supports PCAP reading, protocol statistics, and detailed DNS traffic analysis.
+
+The project is under active development, with further improvements and features planned.
