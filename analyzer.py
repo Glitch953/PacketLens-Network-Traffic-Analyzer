@@ -1,6 +1,69 @@
 
-from scapy.all import TCP, UDP, ICMP, DNS, DNSQR, DNSRR
+from collections import Counter, defaultdict, deque
 
+from scapy.all import (
+    IP,
+    IPv6,
+    TCP,
+    UDP,
+    ICMP,
+    DNS,
+    DNSQR,
+    DNSRR
+)
+
+
+# ==========================================
+# DNS TYPE NAMES
+# ==========================================
+
+DNS_TYPE_NAMES = {
+    1: "A",
+    2: "NS",
+    5: "CNAME",
+    6: "SOA",
+    12: "PTR",
+    15: "MX",
+    16: "TXT",
+    28: "AAAA",
+    29: "LOC",
+    33: "SRV",
+    35: "NAPTR",
+    39: "DNAME",
+    41: "OPT",
+    43: "DS",
+    46: "RRSIG",
+    47: "NSEC",
+    48: "DNSKEY",
+    50: "NSEC3",
+    52: "TLSA",
+    64: "SVCB",
+    65: "HTTPS",
+    255: "ANY"
+}
+
+
+# ==========================================
+# DNS RESPONSE CODE NAMES
+# ==========================================
+
+DNS_RESPONSE_CODES = {
+    0: "ok",
+    1: "formerr",
+    2: "servfail",
+    3: "nxdomain",
+    4: "notimp",
+    5: "refused",
+    6: "yxdomain",
+    7: "xrrset",
+    8: "notauth",
+    9: "notzone"
+}
+
+
+# ==========================================
+# HELPER FUNCTIONS
+# ==========================================
 
 def decode_value(value):
     """Convert DNS values into readable strings."""
@@ -17,47 +80,160 @@ def decode_value(value):
     return value
 
 
+def get_dns_type_name(type_number):
+    """Convert DNS type number into a readable name."""
+
+    return DNS_TYPE_NAMES.get(type_number, str(type_number))
+
+
+def get_domain(dns):
+    """Extract the queried domain from a DNS packet."""
+
+    if dns.qd is None:
+        return None
+
+    return decode_value(dns.qd.qname).rstrip(".") + "."
+
+
+def get_query_type(dns):
+    """Extract DNS query type."""
+
+    if dns.qd is None:
+        return None
+
+    return int(dns.qd.qtype)
+
+
+def get_response_code(dns):
+    """Extract readable DNS response code."""
+
+    code = int(dns.rcode)
+
+    return DNS_RESPONSE_CODES.get(code, f"unknown_{code}")
+
+
+def get_packet_endpoints(packet):
+    """Extract IP addresses and transport ports."""
+
+    if IP in packet:
+        src_ip = packet[IP].src
+        dst_ip = packet[IP].dst
+
+    elif IPv6 in packet:
+        src_ip = packet[IPv6].src
+        dst_ip = packet[IPv6].dst
+
+    else:
+        return None
+
+    if UDP in packet:
+        src_port = packet[UDP].sport
+        dst_port = packet[UDP].dport
+
+    elif TCP in packet:
+        src_port = packet[TCP].sport
+        dst_port = packet[TCP].dport
+
+    else:
+        return None
+
+    return src_ip, dst_ip, src_port, dst_port
+
+
+# ==========================================
+# DNS ANSWER EXTRACTION - FIXED
+# ==========================================
+
+def extract_dns_answers(dns):
+    """Extract all DNS answer records."""
+
+    answers = []
+
+    records = dns.an
+
+    if not records:
+        return answers
+
+    # Scapy returns DNS answers as a list.
+    for record in records:
+
+        if not isinstance(record, DNSRR):
+            continue
+
+        record_type = int(record.type)
+
+        answer = {
+            "domain": decode_value(record.rrname),
+            "type": get_dns_type_name(record_type),
+            "data": decode_value(record.rdata),
+            "ttl": int(record.ttl)
+        }
+
+        answers.append(answer)
+
+    return answers
+
+
+# ==========================================
+# MAIN ANALYZER
+# ==========================================
+
 def analyze_packets(packets):
 
-    dns_queries = {}
-    dns_answers = []
-    dns_ip_mapping = {}
-    dns_transactions = {}
-
-    dns_transaction_stats = {
-        "total_transactions": 0,
-        "successful": 0,
-        "failed": 0,
-        "no_response": 0,
-        "unmatched_responses": 0
-    }
-
-    dns_response_code_stats = {}
-
-    dns_query_types = {}
-    dns_response_types = {}
-
-    # Get DNS Response Code field
-    rcode_field = next(
-        field for field in DNS.fields_desc
-        if field.name == "rcode"
-    )
+    # --------------------------------------
+    # Protocol Statistics
+    # --------------------------------------
 
     protocol_stats = {
         "TCP": 0,
         "UDP": 0,
         "ICMP": 0,
-        "DNS": 0,
-        "DNS_QUERY": 0,
-        "DNS_RESPONSE": 0,
         "Other": 0,
         "Total": 0
     }
 
-    # Analyze each packet
+    # --------------------------------------
+    # DNS Statistics
+    # --------------------------------------
+
+    dns_queries = Counter()
+
+    dns_query_types = Counter()
+
+    dns_response_types = Counter()
+
+    dns_response_code_stats = Counter()
+
+    dns_answers = []
+
+    dns_ip_mapping = defaultdict(set)
+
+    dns_transactions = {}
+
+    pending_transactions = defaultdict(deque)
+
+    transaction_counters = Counter()
+
+    total_dns_packets = 0
+
+    dns_query_count = 0
+
+    dns_response_count = 0
+
+    unmatched_responses = 0
+
+    # ======================================
+    # PROCESS PACKETS
+    # ======================================
+
     for packet in packets:
 
-        # Protocol Analysis
+        protocol_stats["Total"] += 1
+
+        # ----------------------------------
+        # Protocol Detection
+        # ----------------------------------
+
         if TCP in packet:
             protocol_stats["TCP"] += 1
 
@@ -70,276 +246,213 @@ def analyze_packets(packets):
         else:
             protocol_stats["Other"] += 1
 
-        # Check DNS
+        # ----------------------------------
+        # DNS Detection
+        # ----------------------------------
+
         if DNS not in packet:
             continue
 
         dns = packet[DNS]
-        protocol_stats["DNS"] += 1
 
-        # DNS Query Analysis
-        if dns.qr == 0 and dns.qd:
+        total_dns_packets += 1
 
-            transaction_id = dns.id
+        endpoints = get_packet_endpoints(packet)
 
-            domain = decode_value(dns.qd.qname)
-            query_type = dns.qd.qtype
+        if endpoints is None:
+            continue
 
-            dns_transactions[transaction_id] = {
+        src_ip, dst_ip, src_port, dst_port = endpoints
+
+        domain = get_domain(dns)
+
+        query_type = get_query_type(dns)
+
+        if domain is None:
+            continue
+
+        # ==================================
+        # DNS QUERY
+        # ==================================
+
+        if dns.qr == 0:
+
+            dns_query_count += 1
+
+            dns_queries[domain] += 1
+
+            if query_type is not None:
+                dns_query_types[
+                    get_dns_type_name(query_type)
+                ] += 1
+
+            base_key = (
+                int(dns.id),
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                domain,
+                query_type
+            )
+
+            transaction_counters[base_key] += 1
+
+            occurrence = transaction_counters[base_key]
+
+            transaction_key = base_key + (occurrence,)
+
+            dns_transactions[transaction_key] = {
+                "transaction_id": int(dns.id),
                 "domain": domain,
                 "query_type": query_type,
                 "response": None
             }
 
-            protocol_stats["DNS_QUERY"] += 1
+            pending_transactions[base_key].append(
+                transaction_key
+            )
 
-            if packet.haslayer(DNSQR):
+        # ==================================
+        # DNS RESPONSE
+        # ==================================
 
-                query_name = decode_value(packet[DNSQR].qname)
-                query_type = packet[DNSQR].qtype
-
-                dns_queries[query_name] = (
-                    dns_queries.get(query_name, 0) + 1
-                )
-
-                dns_query_types[query_type] = (
-                    dns_query_types.get(query_type, 0) + 1
-                )
-
-        # DNS Response Analysis
         elif dns.qr == 1:
 
-            protocol_stats["DNS_RESPONSE"] += 1
+            dns_response_count += 1
 
-            transaction_id = dns.id
+            response_code = int(dns.rcode)
 
-            transaction = dns_transactions.get(transaction_id)
+            dns_response_code_stats[
+                get_response_code(dns)
+            ] += 1
 
-            # Count DNS Response Codes
-            dns_response_code_stats[dns.rcode] = (
-                dns_response_code_stats.get(dns.rcode, 0) + 1
+            answers = extract_dns_answers(dns)
+
+            # ----------------------------------
+            # Answer Analysis
+            # ----------------------------------
+
+            for answer in answers:
+
+                dns_answers.append(answer)
+
+                answer_domain = answer["domain"].rstrip(".") + "."
+
+                answer_type = answer["type"]
+
+                answer_data = answer["data"]
+
+                dns_response_types[answer_type] += 1
+
+                if answer_type in ("A", "AAAA"):
+
+                    dns_ip_mapping[answer_domain].add(
+                        answer_data
+                    )
+
+            # ----------------------------------
+            # Match Response With Query
+            # ----------------------------------
+
+            response_base_key = (
+                int(dns.id),
+                dst_ip,
+                src_ip,
+                dst_port,
+                src_port,
+                domain,
+                query_type
             )
 
-            if transaction is None:
-                dns_transaction_stats["unmatched_responses"] += 1
-                continue
+            pending_queue = pending_transactions.get(
+                response_base_key
+            )
 
-            transaction["response"] = {
-                "transaction_id": dns.id,
-                "response_code": dns.rcode,
-                "answers": []
-            }
+            if pending_queue:
 
-            if dns.ancount > 0 and dns.an:
+                transaction_key = pending_queue.popleft()
 
-                record = dns.an
+                dns_transactions[transaction_key]["response"] = {
+                    "transaction_id": int(dns.id),
+                    "response_code": response_code,
+                    "answers": answers
+                }
 
-                for _ in range(dns.ancount):
-
-                    # Check whether this is an Answer Record
-                    if not hasattr(record, "rrname") or not hasattr(record, "type"):
-                        break
-
-                    # Extract record information
-                    record_name = decode_value(record.rrname)
-                    record_type = record.type
-
-                    # Convert record type number to readable name
-                    record_type_name = DNSRR.fields_desc[1].i2s.get(
-                        record_type, "Unknown"
-                    )
-
-                    # Extract record data
-                    record_data = record.fields.get("rdata")
-
-                    # Handle records such as MX
-                    if record_data is None:
-                        record_data = record.fields.get("exchange")
-
-                    record_data = decode_value(record_data)
-
-                    # Extract MX preference if available
-                    preference = record.fields.get("preference")
-
-                    if preference is not None:
-                        record_data = {
-                            "preference": preference,
-                            "exchange": record_data
-                        }
-
-                    # Store Answer Record
-                    answer = {
-                        "name": record_name,
-                        "type": record_type_name,
-                        "data": record_data
-                    }
-
-                    dns_answers.append(answer)
-
-                    transaction["response"]["answers"].append(answer)
-
-                    # Map IP addresses to domain names for A and AAAA records
-                    if record_type in [1, 28]:
-
-                        if record_name not in dns_ip_mapping:
-                            dns_ip_mapping[record_name] = []
-
-                        if record_data not in dns_ip_mapping[record_name]:
-                            dns_ip_mapping[record_name].append(record_data)
-
-                    # Count DNS Response Types
-                    dns_response_types[record_type] = (
-                        dns_response_types.get(record_type, 0) + 1
-                    )
-
-                    # Move to the next Answer Record
-                    record = record.payload
-
-    # DNS Transaction Statistics
-    if len(dns_transactions) > 0:
-
-        dns_transaction_stats["total_transactions"] = len(dns_transactions)
-
-        for transaction in dns_transactions.values():
-
-            if transaction["response"] is None:
-                dns_transaction_stats["no_response"] += 1
-
-            elif transaction["response"]["response_code"] == 0:
-                dns_transaction_stats["successful"] += 1
+                if not pending_queue:
+                    del pending_transactions[response_base_key]
 
             else:
-                dns_transaction_stats["failed"] += 1
 
-    # Total packets
-    protocol_stats["Total"] = len(packets)
+                unmatched_responses += 1
 
-    # Display Protocol Statistics
-    print("\n========== Protocol Statistics ==========")
+    # ======================================
+    # TRANSACTION STATISTICS
+    # ======================================
 
-    for protocol, count in protocol_stats.items():
-        print(f"{protocol}: {count}")
+    total_transactions = len(dns_transactions)
 
-    # Unique Domains
-    print("\n========== Unique Domains ==========")
-    print(len(dns_queries))
+    successful_transactions = 0
 
-    # Top 3 DNS Queries
-    print("\n========== Top 3 DNS Queries ==========")
+    failed_transactions = 0
 
-    sorted_queries = sorted(
-        dns_queries.items(),
-        key=lambda x: x[1],
-        reverse=True
-    )[:3]
+    no_response_transactions = 0
 
-    for query, count in sorted_queries:
-        print(f"{query} | Count: {count}")
+    for transaction in dns_transactions.values():
 
-    # DNS Query Types
-    print("\n========== DNS Query Types ==========")
+        response = transaction["response"]
 
-    for dns_type, count in dns_query_types.items():
+        if response is None:
 
-        type_name = DNSQR.fields_desc[1].i2s.get(
-            dns_type, "Unknown"
-        )
+            no_response_transactions += 1
 
-        print(f"{type_name}: {count}")
+        elif response["response_code"] == 0:
 
-    # DNS Response Types
-    print("\n========== DNS Response Types ==========")
-
-    for dns_type, count in dns_response_types.items():
-
-        type_name = DNSRR.fields_desc[1].i2s.get(
-            dns_type, "Unknown"
-        )
-
-        print(f"{type_name}: {count}")
-
-    # DNS Response Code Statistics
-    print("\n========== DNS Response Code Statistics ==========")
-
-    for response_code, count in dns_response_code_stats.items():
-
-        response_code_name = rcode_field.i2s.get(
-            response_code, "Unknown"
-        )
-
-        print(f"{response_code_name}: {count}")
-
-    # DNS Answer Records
-    print("\n========== DNS Answer Records ==========")
-
-    for answer in dns_answers:
-
-        print(
-            f"Domain: {answer['name']} | "
-            f"Type: {answer['type']} | "
-            f"Data: {answer['data']}"
-        )
-
-    # DNS IP Mapping
-    print("\n========== DNS IP Mapping ==========")
-
-    for domain, ips in dns_ip_mapping.items():
-
-        print(f"\nDomain: {domain}")
-
-        for ip in ips:
-            print(f"    IP: {ip}")
-
-    # DNS Transactions
-    print("\n========== DNS Transactions ==========")
-
-    for transaction_id, transaction in dns_transactions.items():
-
-        print(f"\nTransaction ID: {transaction_id}")
-        print(f"Domain: {transaction['domain']}")
-        print(f"Query Type: {transaction['query_type']}")
-
-        if transaction["response"] is not None:
-
-            print("Response: Matched")
-
-            print(
-                f"Response Code: "
-                f"{transaction['response']['response_code']}"
-            )
-
-            print("Answers:")
-
-            for answer in transaction["response"]["answers"]:
-                print(
-                    f"  {answer['name']} | "
-                    f"{answer['type']} | "
-                    f"{answer['data']}"
-                )
+            successful_transactions += 1
 
         else:
-            print("Response: Not Found")
 
-    # DNS Transaction Statistics
-    print("\n========== DNS Transaction Statistics ==========")
+            failed_transactions += 1
 
-    print("Total Transactions:", dns_transaction_stats["total_transactions"])
-    print("Successful Transactions:", dns_transaction_stats["successful"])
-    print("Failed Transactions:", dns_transaction_stats["failed"])
-    print("No Response Transactions:", dns_transaction_stats["no_response"])
-    print("Unmatched Responses:", dns_transaction_stats["unmatched_responses"])
-
-    # Return Results
-    results = {
-        "protocol_stats": protocol_stats,
-        "dns_queries": dns_queries,
-        "dns_query_types": dns_query_types,
-        "dns_response_types": dns_response_types,
-        "dns_response_code_stats": dns_response_code_stats,
-        "dns_answers": dns_answers,
-        "dns_ip_mapping": dns_ip_mapping,
-        "dns_transactions": dns_transactions,
-        "dns_transaction_stats": dns_transaction_stats
+    dns_transaction_stats = {
+        "total_transactions": total_transactions,
+        "successful": successful_transactions,
+        "failed": failed_transactions,
+        "no_response": no_response_transactions,
+        "unmatched_responses": unmatched_responses
     }
 
-    return results
+    # ======================================
+    # FINAL RESULTS
+    # ======================================
+
+    return {
+
+        "protocol_stats": protocol_stats,
+
+        "total_dns_packets": total_dns_packets,
+
+        "dns_query_count": dns_query_count,
+
+        "dns_response_count": dns_response_count,
+
+        "dns_queries": dns_queries,
+
+        "dns_query_types": dns_query_types,
+
+        "dns_response_types": dns_response_types,
+
+        "dns_response_code_stats": dns_response_code_stats,
+
+        "dns_answers": dns_answers,
+
+        "dns_ip_mapping": {
+            domain: sorted(ips)
+            for domain, ips in dns_ip_mapping.items()
+        },
+
+        "dns_transactions": dns_transactions,
+
+        "dns_transaction_stats": dns_transaction_stats
+
+    }
